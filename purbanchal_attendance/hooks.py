@@ -2,9 +2,21 @@ app_name = "purbanchal_attendance"
 app_title = "Purbanchal Attendance"
 app_publisher = "IBSL Pune"
 app_description = "Purbanchal Attendance"
-app_email = "gurutej.j@indibasolutions.com"
+app_email = "design@indibasolutions.com"
 app_license = "mit"
+required_apps = ["hrms"]
 
+
+
+after_migrate = ["purbanchal_attendance.install.setup_custom_fields"]
+
+scheduler_events = {
+    "cron": {
+        "*/15 * * * *": [
+            "purbanchal_attendance.etimeoffice.sync.scheduled_sync",
+        ]
+    }
+}
 # Apps
 # ------------------
 

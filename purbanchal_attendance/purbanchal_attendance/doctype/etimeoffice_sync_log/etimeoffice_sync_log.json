@@ -1,0 +1,28 @@
+{
+ "doctype": "DocType",
+ "name": "Etimeoffice Sync Log",
+ "module": "Purbanchal Attendance",
+ "autoname": "format:ETO-SYNC-{#####}",
+ "field_order": [
+  "status", "started_on", "finished_on", "empcode", "from_record", "to_record",
+  "fetched", "checkins_created", "skipped", "unmapped_codes", "row_errors", "fatal_error"
+ ],
+ "fields": [
+  {"fieldname": "status", "fieldtype": "Select", "label": "Status",
+   "options": "Success\nDry Run\nPartial\nFailed", "in_list_view": 1, "reqd": 1},
+  {"fieldname": "started_on", "fieldtype": "Datetime", "label": "Started On", "in_list_view": 1},
+  {"fieldname": "finished_on", "fieldtype": "Datetime", "label": "Finished On"},
+  {"fieldname": "empcode", "fieldtype": "Data", "label": "Employee Code Filter"},
+  {"fieldname": "from_record", "fieldtype": "Data", "label": "From Record"},
+  {"fieldname": "to_record", "fieldtype": "Data", "label": "To Record"},
+  {"fieldname": "fetched", "fieldtype": "Int", "label": "Records Fetched"},
+  {"fieldname": "checkins_created", "fieldtype": "Int", "label": "Check-ins Created"},
+  {"fieldname": "skipped", "fieldtype": "Int", "label": "Skipped"},
+  {"fieldname": "unmapped_codes", "fieldtype": "Small Text", "label": "Unmapped Employee Codes"},
+  {"fieldname": "row_errors", "fieldtype": "Long Text", "label": "Row Errors"},
+  {"fieldname": "fatal_error", "fieldtype": "Long Text", "label": "Fatal Error"}
+ ],
+ "permissions": [
+  {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "report": 1}
+ ]
+}

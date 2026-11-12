@@ -1,0 +1,32 @@
+{
+ "doctype": "DocType",
+ "name": "Etimeoffice Settings",
+ "module": "Purbanchal Attendance",
+ "issingle": 1,
+ "field_order": [
+  "connection_section", "enabled", "dry_run", "base_url", "corporate_id",
+  "username", "password", "empcode", "request_timeout", "column_break_1",
+  "sync_section", "initial_last_record", "last_max_record", "last_sync_on"
+ ],
+ "fields": [
+  {"fieldname": "connection_section", "fieldtype": "Section Break", "label": "Connection"},
+  {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled (scheduler syncs every 15 min)", "default": "0"},
+  {"fieldname": "dry_run", "fieldtype": "Check", "label": "Dry Run (fetch and validate only, create nothing)", "default": "1"},
+  {"fieldname": "base_url", "fieldtype": "Data", "label": "Base URL", "default": "https://api.etimeoffice.com/api", "reqd": 1},
+  {"fieldname": "corporate_id", "fieldtype": "Data", "label": "Corporate ID", "reqd": 1},
+  {"fieldname": "username", "fieldtype": "Data", "label": "Username", "reqd": 1},
+  {"fieldname": "password", "fieldtype": "Password", "label": "Password", "reqd": 1},
+  {"fieldname": "empcode", "fieldtype": "Data", "label": "Employee Code Filter", "default": "ALL",
+   "description": "Keep ALL in production. A single code such as 0001 is for testing only."},
+  {"fieldname": "request_timeout", "fieldtype": "Int", "label": "Request Timeout (seconds)", "default": "60"},
+  {"fieldname": "column_break_1", "fieldtype": "Column Break"},
+  {"fieldname": "sync_section", "fieldtype": "Section Break", "label": "Sync State"},
+  {"fieldname": "initial_last_record", "fieldtype": "Data", "label": "Initial LastRecord (MMyyyy$ID)",
+   "description": "Used only until the first successful sync. Example: 042026$454"},
+  {"fieldname": "last_max_record", "fieldtype": "Data", "label": "Last MaxRecord", "read_only": 1},
+  {"fieldname": "last_sync_on", "fieldtype": "Datetime", "label": "Last Successful Sync", "read_only": 1}
+ ],
+ "permissions": [
+  {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "print": 1, "email": 1, "share": 1, "report": 1}
+ ]
+}
