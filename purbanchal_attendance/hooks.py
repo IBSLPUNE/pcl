@@ -8,11 +8,10 @@ required_apps = ["hrms"]
 
 
 
-after_migrate = ["purbanchal_attendance.install.setup_custom_fields"]
-
 scheduler_events = {
     "cron": {
-        "*/15 * * * *": [
+        # Runs every minute. The interval is read from Etimeoffice Settings.
+        "* * * * *": [
             "purbanchal_attendance.etimeoffice.sync.scheduled_sync",
         ]
     }
