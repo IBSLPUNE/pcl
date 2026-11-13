@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import frappe
 from frappe import _
@@ -8,20 +8,37 @@ from frappe.utils import now_datetime
 from purbanchal_attendance.etimeoffice.client import EtimeofficeClient
 
 SETTINGS = "Etimeoffice Settings"
-MAX_BATCHES = 50  # safety limit per run
+PUNCH = "Etimeoffice Punch"
+DEVICE_ID = "E-TIMEOFFICE"
+MAX_BATCHES = 50
+MAX_ROW_ERRORS = 200
+LOCK_TIMEOUT = timedelta(minutes=30)
 RECORD_RE = re.compile(r"^\d{6}\$\d+$")
 
 
+# ---------- Entry points ----------
+
 def scheduled_sync():
+    """Runs every minute from hooks. Does real work only when enabled and the interval has passed."""
     settings = frappe.get_single(SETTINGS)
-    if settings.enabled:
-        run_sync(settings)
+    if not settings.enabled:
+        return
+    interval = timedelta(minutes=max(int(settings.sync_interval_minutes or 15), 1))
+    last = settings.last_attempt_on
+    if last and now_datetime() - last < interval:
+        return
+    _locked_run()
 
 
 @frappe.whitelist()
 def run_sync_now():
     frappe.only_for("System Manager")
-    return run_sync(frappe.get_single(SETTINGS))
+    frappe.enqueue("purbanchal_attendance.etimeoffice.sync.run_manual_job", queue="long", timeout=3600)
+    return {"queued": True}
+
+
+def run_manual_job():
+    _locked_run()
 
 
 @frappe.whitelist()
@@ -31,12 +48,79 @@ def test_connection():
     return {"ok": True, "punches_last_24h": len(_punches_from(data))}
 
 
+@frappe.whitelist()
+def retry_unmapped():
+    frappe.only_for("System Manager")
+    frappe.enqueue("purbanchal_attendance.etimeoffice.sync.retry_unmapped_job", queue="long", timeout=3600)
+    return {"queued": True}
+
+
+def retry_unmapped_job():
+    emp_cache = {}
+    rows = frappe.get_all(PUNCH, filters={"status": "Unmapped"}, fields=["name", "empcode", "punch_time"])
+    fixed = 0
+    for row in rows:
+        employee = _find_employee(row.empcode, emp_cache)
+        if not employee:
+            continue
+        frappe.db.savepoint("etoff_retry")
+        try:
+            checkin = frappe.get_doc({
+                "doctype": "Employee Checkin",
+                "employee": employee,
+                "time": row.punch_time,
+                "device_id": DEVICE_ID,
+            }).insert(ignore_permissions=True)
+            frappe.db.set_value(PUNCH, row.name, {
+                "status": "Imported",
+                "employee": employee,
+                "employee_checkin": checkin.name,
+                "synced_on": now_datetime(),
+            })
+            frappe.db.commit()
+            fixed += 1
+        except Exception:
+            frappe.db.rollback(save_point="etoff_retry")
+            frappe.log_error(title="Etimeoffice retry failed", message=frappe.get_traceback())
+    return fixed
+
+
+# ---------- Lock and interval ----------
+
+def _locked_run():
+    if not _acquire_lock():
+        return None
+    try:
+        return run_sync(frappe.get_single(SETTINGS))
+    finally:
+        _release_lock()
+
+
+def _acquire_lock():
+    now = now_datetime()
+    started = frappe.db.get_single_value(SETTINGS, "sync_started_on")
+    if started and now - started < LOCK_TIMEOUT:
+        return False  # another run is still active
+    frappe.db.set_single_value(SETTINGS, "sync_started_on", now)
+    frappe.db.set_single_value(SETTINGS, "last_attempt_on", now)
+    frappe.db.commit()
+    return True
+
+
+def _release_lock():
+    frappe.db.rollback()
+    frappe.db.set_single_value(SETTINGS, "sync_started_on", None)
+    frappe.db.commit()
+
+
+# ---------- Sync ----------
+
 def run_sync(settings):
     dry_run = bool(settings.dry_run)
     empcode = (settings.empcode or "ALL").strip()
 
-    # Save the cursor only when pulling ALL employees. A single-employee pull
-    # could move the cursor past other employees' punches.
+    # Move the cursor only when pulling ALL employees, so a single-employee test
+    # cannot skip other employees' punches.
     persist_cursor = (not dry_run) and empcode.upper() == "ALL"
 
     cursor = settings.last_max_record or settings.initial_last_record
@@ -51,7 +135,7 @@ def run_sync(settings):
         "to_record": cursor,
         "status": "Success",
     })
-    stats = {"fetched": 0, "created": 0, "skipped": 0}
+    stats = {"fetched": 0, "created": 0, "skipped": 0, "unmapped": 0, "blocked": False}
     unmapped, row_errors, emp_cache = set(), [], {}
 
     try:
@@ -64,11 +148,13 @@ def run_sync(settings):
                 break
 
             _process_batch(punches, stats, unmapped, row_errors, emp_cache, dry_run)
+            if stats["blocked"]:
+                break  # never move the cursor past a record that failed
 
             if persist_cursor and new_cursor and RECORD_RE.match(new_cursor):
                 frappe.db.set_single_value(SETTINGS, "last_max_record", new_cursor)
                 frappe.db.set_single_value(SETTINGS, "last_sync_on", now_datetime())
-            frappe.db.commit()
+                frappe.db.commit()
 
             if not new_cursor or new_cursor == cursor or not RECORD_RE.match(new_cursor):
                 break
@@ -85,12 +171,14 @@ def run_sync(settings):
     log.checkins_created = stats["created"]
     log.skipped = stats["skipped"]
     log.unmapped_codes = ", ".join(sorted(unmapped))
-    log.row_errors = "\n".join(row_errors)
+    log.row_errors = "\n".join(row_errors[:MAX_ROW_ERRORS])
 
     if log.status == "Success":
-        if dry_run:
+        if stats["blocked"]:
+            log.status = "Partial"
+        elif dry_run:
             log.status = "Dry Run"
-        elif unmapped or row_errors:
+        elif stats["unmapped"]:
             log.status = "Partial"
 
     log.finished_on = now_datetime()
@@ -99,67 +187,72 @@ def run_sync(settings):
     return log.name
 
 
-def _punches_from(data):
-    if isinstance(data, list):  # DownloadPunchData returns a plain list
-        return data
-    return (data or {}).get("PunchData") or []
-
-
 def _process_batch(punches, stats, unmapped, row_errors, emp_cache, dry_run):
-    parsed = []
     for p in punches:
         stats["fetched"] += 1
-        etid = str(p.get("ID") or "").strip()
+        table = str(p.get("Table") or "").strip()
+        rec_id = str(p.get("ID") or "").strip()
         code = str(p.get("Empcode") or "").strip()
         ptime = _parse_punch_time(p.get("PunchDate"))
-        if etid and code and ptime:
-            parsed.append((etid, code, ptime))
-        else:
-            stats["skipped"] += 1
-            row_errors.append(f"Unparseable record: {p}")
 
-    ids = list({etid for etid, _code, _time in parsed})
-    existing = set()
-    if ids:
-        existing = set(frappe.get_all(
-            "Employee Checkin",
-            filters={"etimeoffice_id": ["in", ids]},
-            pluck="etimeoffice_id",
-        ))
+        if not (table and rec_id and code and ptime):
+            # Stop instead of skipping, so a bad record is never lost silently.
+            stats["blocked"] = True
+            row_errors.append(f"Unreadable record, sync stopped before it: {p}")
+            break
 
-    for etid, code, ptime in parsed:
-        if etid in existing:
+        key = f"{table}:{rec_id}"
+        if frappe.db.exists(PUNCH, key):
             stats["skipped"] += 1
             continue
 
         employee = _find_employee(code, emp_cache)
-        if not employee:
-            unmapped.add(code)
-            stats["skipped"] += 1
-            continue
 
         if dry_run:
-            stats["created"] += 1
+            if employee:
+                stats["created"] += 1
+            else:
+                stats["unmapped"] += 1
+                unmapped.add(code)
             continue
 
-        # Savepoint so one bad row doesn't abort the whole batch
-        frappe.db.savepoint("etimeoffice_row")
+        frappe.db.savepoint("etoff_row")
         try:
+            checkin_name = None
+            if employee:
+                checkin = frappe.get_doc({
+                    "doctype": "Employee Checkin",
+                    "employee": employee,
+                    "time": ptime,
+                    "device_id": DEVICE_ID,
+                }).insert(ignore_permissions=True)
+                checkin_name = checkin.name
+
             frappe.get_doc({
-                "doctype": "Employee Checkin",
+                "doctype": PUNCH,
+                "punch_key": key,
+                "source_table": table,
+                "source_id": rec_id,
+                "empcode": code,
+                "punch_time": ptime,
                 "employee": employee,
-                "time": ptime,
-                "device_id": "E-TIMEOFFICE",
-                "etimeoffice_id": etid,
-                # log_type left blank: raw punches have no IN/OUT direction.
-                # HRMS Shift Type decides it.
+                "employee_checkin": checkin_name,
+                "status": "Imported" if employee else "Unmapped",
+                "synced_on": now_datetime(),
             }).insert(ignore_permissions=True)
-            existing.add(etid)
+        except Exception:
+            frappe.db.rollback(save_point="etoff_row")
+            stats["blocked"] = True
+            row_errors.append(f"Row {key} failed, sync stopped before it: {frappe.get_traceback()[-400:]}")
+            break
+
+        if employee:
             stats["created"] += 1
-        except Exception as exc:
-            frappe.db.rollback(save_point="etimeoffice_row")
-            stats["skipped"] += 1
-            row_errors.append(f"ID {etid} | {code} | {ptime}: {exc}")
+        else:
+            stats["unmapped"] += 1
+            unmapped.add(code)
+
+    frappe.db.commit()
 
 
 def _find_employee(code, cache):
@@ -173,6 +266,12 @@ def _find_employee(code, cache):
         )
         cache[code] = matches[0] if len(matches) == 1 else None
     return cache[code]
+
+
+def _punches_from(data):
+    if isinstance(data, list):
+        return data
+    return (data or {}).get("PunchData") or []
 
 
 def _parse_punch_time(value):

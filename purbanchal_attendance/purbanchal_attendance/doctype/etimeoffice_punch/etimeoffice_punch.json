@@ -1,0 +1,24 @@
+{
+ "doctype": "DocType",
+ "name": "Etimeoffice Punch",
+ "module": "Purbanchal Attendance",
+ "autoname": "field:punch_key",
+ "field_order": [
+  "punch_key", "status", "empcode", "employee", "punch_time",
+  "employee_checkin", "source_table", "source_id", "synced_on"
+ ],
+ "fields": [
+  {"fieldname": "punch_key", "fieldtype": "Data", "label": "Punch Key (Table:ID)", "reqd": 1, "unique": 1, "read_only": 1, "in_list_view": 1},
+  {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Imported\nUnmapped", "default": "Imported", "reqd": 1, "in_list_view": 1},
+  {"fieldname": "empcode", "fieldtype": "Data", "label": "Device Employee Code", "reqd": 1, "in_list_view": 1},
+  {"fieldname": "employee", "fieldtype": "Link", "label": "Employee", "options": "Employee"},
+  {"fieldname": "punch_time", "fieldtype": "Datetime", "label": "Punch Time", "reqd": 1, "in_list_view": 1},
+  {"fieldname": "employee_checkin", "fieldtype": "Link", "label": "Employee Checkin", "options": "Employee Checkin"},
+  {"fieldname": "source_table", "fieldtype": "Data", "label": "Source Table"},
+  {"fieldname": "source_id", "fieldtype": "Data", "label": "Source ID"},
+  {"fieldname": "synced_on", "fieldtype": "Datetime", "label": "Synced On"}
+ ],
+ "permissions": [
+  {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "report": 1}
+ ]
+}
