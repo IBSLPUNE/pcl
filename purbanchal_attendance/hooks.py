@@ -10,10 +10,14 @@ required_apps = ["hrms"]
 
 scheduler_events = {
     "cron": {
-        # Runs every minute. The interval is read from Etimeoffice Settings.
-        "* * * * *": [
+        # Every 5 minutes. Runs one E-timeoffice sync when the integration is enabled.
+        "*/5 * * * *": [
             "purbanchal_attendance.etimeoffice.sync.scheduled_sync",
-        ]
+        ],
+        # Hourly safety net: labels blank E-TIMEOFFICE check-ins from the last 7 days.
+        "0 * * * *": [
+            "purbanchal_attendance.etimeoffice.inout_sync.label_recent",
+        ],
     }
 }
 # Apps

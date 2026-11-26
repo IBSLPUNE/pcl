@@ -1,4 +1,5 @@
 import re
+import time
 from datetime import datetime, timedelta
 
 import frappe
@@ -6,26 +7,26 @@ from frappe import _
 from frappe.utils import now_datetime
 
 from purbanchal_attendance.etimeoffice.client import EtimeofficeClient
+from purbanchal_attendance.etimeoffice.inout_sync import sync_inout_log_types
 
 SETTINGS = "Etimeoffice Settings"
 PUNCH = "Etimeoffice Punch"
 DEVICE_ID = "E-TIMEOFFICE"
 MAX_BATCHES = 50
 MAX_ROW_ERRORS = 200
-LOCK_TIMEOUT = timedelta(minutes=30)
+# The cron runs every 5 minutes and RQ kills a scheduled job after 5 minutes,
+# so a lock older than 6 minutes belongs to a run that died.
+LOCK_TIMEOUT = timedelta(minutes=6)
+# Start no new batch after 3 minutes, so the run ends before RQ's 5-minute kill.
+RUN_BUDGET_SECONDS = 180
 RECORD_RE = re.compile(r"^\d{6}\$\d+$")
 
 
 # ---------- Entry points ----------
 
 def scheduled_sync():
-    """Runs every minute from hooks. Does real work only when enabled and the interval has passed."""
-    settings = frappe.get_single(SETTINGS)
-    if not settings.enabled:
-        return
-    interval = timedelta(minutes=max(int(settings.sync_interval_minutes or 15), 1))
-    last = settings.last_attempt_on
-    if last and now_datetime() - last < interval:
+    """Cron entry point, every 5 minutes (hooks.py). Runs one sync when the integration is enabled."""
+    if not frappe.db.get_single_value(SETTINGS, "enabled"):
         return
     _locked_run()
 
@@ -58,7 +59,7 @@ def retry_unmapped():
 def retry_unmapped_job():
     emp_cache = {}
     rows = frappe.get_all(PUNCH, filters={"status": "Unmapped"}, fields=["name", "empcode", "punch_time"])
-    fixed = 0
+    fixed, fixed_times = 0, []
     for row in rows:
         employee = _find_employee(row.empcode, emp_cache)
         if not employee:
@@ -79,13 +80,20 @@ def retry_unmapped_job():
             })
             frappe.db.commit()
             fixed += 1
+            fixed_times.append(row.punch_time)
         except Exception:
             frappe.db.rollback(save_point="etoff_retry")
             frappe.log_error(title="Etimeoffice retry failed", message=frappe.get_traceback())
+
+    # Newly imported check-ins need IN/OUT labels too.
+    if fixed_times:
+        _, err = _label_window(min(fixed_times).date(), max(fixed_times).date(), dry_run=False)
+        if err:
+            frappe.log_error(title="Etimeoffice retry labeling failed", message=err)
     return fixed
 
 
-# ---------- Lock and interval ----------
+# ---------- Lock ----------
 
 def _locked_run():
     if not _acquire_lock():
@@ -100,7 +108,8 @@ def _acquire_lock():
     now = now_datetime()
     started = frappe.db.get_single_value(SETTINGS, "sync_started_on")
     if started and now - started < LOCK_TIMEOUT:
-        return False  # another run is still active
+        frappe.logger("etimeoffice").info(f"Sync skipped: another run active since {started}")
+        return False
     frappe.db.set_single_value(SETTINGS, "sync_started_on", now)
     frappe.db.set_single_value(SETTINGS, "last_attempt_on", now)
     frappe.db.commit()
@@ -111,6 +120,24 @@ def _release_lock():
     frappe.db.rollback()
     frappe.db.set_single_value(SETTINGS, "sync_started_on", None)
     frappe.db.commit()
+
+
+def _heartbeat():
+    """Refresh the lock timestamp at the start of each batch."""
+    frappe.db.set_single_value(SETTINGS, "sync_started_on", now_datetime())
+    frappe.db.commit()
+
+
+@frappe.whitelist()
+def clear_sync_lock():
+    """Clears a stale lock. System Manager only. Refuses if a lock was set in the last 2 minutes."""
+    frappe.only_for("System Manager")
+    started = frappe.db.get_single_value(SETTINGS, "sync_started_on")
+    if started and now_datetime() - started < timedelta(minutes=2):
+        frappe.throw(_("A sync started less than 2 minutes ago. Wait and try again."))
+    frappe.db.set_single_value(SETTINGS, "sync_started_on", None)
+    frappe.db.commit()
+    return {"cleared": True}
 
 
 # ---------- Sync ----------
@@ -135,12 +162,27 @@ def run_sync(settings):
         "to_record": cursor,
         "status": "Success",
     })
-    stats = {"fetched": 0, "created": 0, "skipped": 0, "unmapped": 0, "blocked": False}
+    stats = {
+        "fetched": 0,
+        "created": 0,
+        "skipped": 0,
+        "unmapped": 0,
+        "blocked": False,
+        "labeled": 0,
+        "label_failed": False,
+    }
     unmapped, row_errors, emp_cache = set(), [], {}
+    run_started = time.monotonic()
 
     try:
         client = EtimeofficeClient(settings)
         for _batch_no in range(MAX_BATCHES):
+            if time.monotonic() - run_started > RUN_BUDGET_SECONDS:
+                # Stop before RQ's kill. The saved cursor lets the next tick continue.
+                frappe.logger("etimeoffice").info("Run budget reached; the next tick continues from the saved cursor")
+                break
+
+            _heartbeat()
             data = client.download_last_punches(cursor, empcode)
             punches = _punches_from(data)
             new_cursor = data.get("MaxRecord") if isinstance(data, dict) else None
@@ -148,6 +190,20 @@ def run_sync(settings):
                 break
 
             _process_batch(punches, stats, unmapped, row_errors, emp_cache, dry_run)
+
+            # Label this batch's check-ins. Labeling never raises; on failure the
+            # import continues and label_recent picks up the blanks later.
+            window = _punch_date_window(punches)
+            if window:
+                count, err = _label_window(window[0], window[1], dry_run)
+                stats["labeled"] += count
+                if err:
+                    stats["label_failed"] = True
+                    row_errors.append(
+                        f"IN/OUT labeling failed for {window[0]} to {window[1]}; "
+                        f"label_recent will retry: {err[-300:]}"
+                    )
+
             if stats["blocked"]:
                 break  # never move the cursor past a record that failed
 
@@ -174,7 +230,7 @@ def run_sync(settings):
     log.row_errors = "\n".join(row_errors[:MAX_ROW_ERRORS])
 
     if log.status == "Success":
-        if stats["blocked"]:
+        if stats["blocked"] or stats["label_failed"]:
             log.status = "Partial"
         elif dry_run:
             log.status = "Dry Run"
@@ -184,7 +240,31 @@ def run_sync(settings):
     log.finished_on = now_datetime()
     log.insert(ignore_permissions=True)
     frappe.db.commit()
+
+    frappe.logger("etimeoffice").info(f"{log.name}: labeled {stats['labeled']} check-ins")
     return log.name
+
+
+def _label_window(start, end, dry_run):
+    """Label blank E-TIMEOFFICE check-ins in start..end. Never raises.
+
+    Returns (count, error_text). error_text is None on success.
+    """
+    frappe.db.savepoint("etoff_label")
+    try:
+        count = sync_inout_log_types(start, end, dry_run=dry_run)["count"]
+        frappe.db.commit()
+        return count, None
+    except Exception:
+        frappe.db.rollback(save_point="etoff_label")
+        return 0, frappe.get_traceback()
+
+
+def _punch_date_window(punches):
+    times = [t for t in (_parse_punch_time(p.get("PunchDate")) for p in punches) if t]
+    if not times:
+        return None
+    return min(times).date(), max(times).date()
 
 
 def _process_batch(punches, stats, unmapped, row_errors, emp_cache, dry_run):
